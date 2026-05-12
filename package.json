@@ -1,0 +1,37 @@
+{
+  "name": "serp-email-scraper",
+  "version": "1.0.0",
+  "description": "Full-stack Playwright SERP scraper with email extraction, captcha solving, and DeepSeek AI validation",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "nodemon server.js",
+    "start:prod": "node server.js",
+    "dev": "nodemon server.js",
+    "install-browsers": "playwright install chromium"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "csv-parse": "^5.5.6",
+    "csv-stringify": "^6.5.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "https-proxy-agent": "^7.0.6",
+    "multer": "^1.4.5-lts.1",
+    "node-fetch": "^2.7.0",
+    "p-queue": "^6.6.2",
+    "playwright": "^1.47.0",
+    "playwright-extra": "^4.3.6",
+    "proxy-chain": "^2.7.1",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "uuid": "^10.0.0",
+    "ws": "^8.18.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

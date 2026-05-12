@@ -1,0 +1,8 @@
+node_modules/
+.env
+data/chrome-profile/
+data/jobs/*.json
+data/results/*
+data/uploads/*
+*.log
+.DS_Store
