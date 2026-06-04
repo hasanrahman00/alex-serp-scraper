@@ -14,8 +14,7 @@
     </div>
     <div class="header-right">
       <span class="status-item" id="status-cdp"><span class="dot"></span>Browser</span>
-      <span class="status-item" id="status-deepseek"><span class="dot"></span>DeepSeek</span>
-      <span class="status-item" id="status-captcha"><span class="dot"></span>Captcha</span>
+      <span class="status-item" id="status-proxy"><span class="dot"></span>Proxy</span>
       <button class="icon-btn" id="settingsBtn" title="Settings" aria-label="Settings">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
       </button>
@@ -31,7 +30,7 @@
           <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
           <div>
             <div class="dz-title">Drop CSV / XLSX / JSON, or <span class="link">browse</span></div>
-            <div class="dz-sub muted small">Required column: <code>Query</code> · auto-starts on upload</div>
+            <div class="dz-sub muted small">Required column: <code>Query</code> · optional: <code>Pages</code> (per-row depth) · auto-starts on upload</div>
           </div>
         </div>
       </label>
@@ -103,29 +102,16 @@
         </section>
 
         <section class="settings-section">
-          <h3>Captcha</h3>
-          <p class="muted small">When Google blocks with <code>/sorry/</code>, the harvester first tries the configured solver, and if that fails (or in <strong>Manual</strong> mode) it pauses and waits up to 5 min for you to click the checkbox in the Chrome window — then resumes automatically.</p>
-          <label class="field">
-            <span>Provider</span>
-            <select id="set-captchaProvider">
-              <option value="manual">Manual (solve in Chrome window)</option>
-              <option value="nocaptcha">NoCaptcha.io  ← best for Google /sorry/</option>
-              <option value="2captcha">2Captcha</option>
-            </select>
-          </label>
-          <label class="field" id="captchaKeyField">
-            <span>API key</span>
-            <input id="set-captchaApiKey" type="text" placeholder="paste your provider key" autocomplete="off" />
-          </label>
-        </section>
-
-        <section class="settings-section">
           <h3>Crawler</h3>
-          <p class="muted small">Each query paginates through every SERP page Google returns and extracts emails directly from the page HTML — result links are not opened. Use the delay range to throttle between page transitions.</p>
+          <p class="muted small">Each query paginates through up to <code>Max SERP pages</code> result pages and extracts emails per result block — capturing the title, URL, and snippet description alongside each address. Override per-query by adding a <code>Pages</code> column to your CSV.</p>
           <label class="field">
             <span>Query suffix <span class="muted">(appended to every CSV row before searching)</span></span>
             <input id="set-querySuffix" type="text" placeholder='e.g. "email" — leave blank to disable' />
           </label>
+          <div class="grid-2">
+            <label class="field"><span>Max SERP pages per query</span><input id="set-maxSerpPages" type="number" min="1" max="20" /></label>
+            <label class="field"><span></span><span class="muted small">hard ceiling is 20</span></label>
+          </div>
           <div class="grid-2">
             <label class="field"><span>Delay min (ms)</span><input id="set-pageDelayMin" type="number" min="0" /></label>
             <label class="field"><span>Delay max (ms)</span><input id="set-pageDelayMax" type="number" min="0" /></label>

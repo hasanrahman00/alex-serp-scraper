@@ -1,10 +1,119 @@
 'use strict';
 
 const { chromium } = require('playwright');
-const { extractFromHtml, dedupeAndScore } = require('./emailExtractor');
-const { maybeSolve, detectCaptcha } = require('./captcha');
+const { extractFromHtml, extractFromText, dedupeAndScore } = require('./emailExtractor');
 const { scrollToPagination, clickNextPage, getNextPageUrl } = require('./serpPaginator');
 const proxyMod = require('./proxy');
+
+// Inline /sorry/ detector — replaces the old captcha solver module. With
+// rotating residential proxies we just skip to the next query (different IP)
+// instead of trying to solve.
+function isGoogleBlock(page) {
+  return /\/sorry\//i.test(page.url());
+}
+
+// Parse the SERP DOM into per-result {title, url, description} objects.
+// We try Google's stable wrapper classes first (.MjjYud / .tF2Cxc / .g),
+// then fall back to a structural heuristic ("div that contains exactly one
+// h3 and one external link"). This is robust against Google's frequent
+// class-name churn.
+async function extractSerpResults(page) {
+  return page.evaluate(() => {
+    const out = [];
+    const seen = new Set();
+    const blocks = new Set();
+    document.querySelectorAll('div.MjjYud, div.tF2Cxc, div.g[data-hveid]').forEach((b) => blocks.add(b));
+    // Heuristic fallback: any div with one h3 + one external anchor.
+    if (blocks.size === 0) {
+      document.querySelectorAll('div').forEach((b) => {
+        if (b.querySelector('h3') && b.querySelector('a[href^="http"]')) blocks.add(b);
+      });
+    }
+    const DESC_SEL = 'div[data-sncf="1"], .VwiC3b, .yXK7lf, .lyLwlc, span.aCOpRe, .lEBKkf';
+    for (const block of blocks) {
+      const a = block.querySelector('a[href^="http"]:not([href*="google."])');
+      const h3 = block.querySelector('h3');
+      if (!a || !h3) continue;
+      const url = a.href;
+      if (seen.has(url)) continue;
+      const title = (h3.textContent || '').trim();
+      if (!title) continue;
+      const descEl = block.querySelector(DESC_SEL);
+      let description = descEl ? (descEl.textContent || '').trim() : '';
+      // Strip Google's trailing "...Read more" suffix.
+      description = description.replace(/\s*…?\s*Read more\s*$/i, '').trim();
+      seen.add(url);
+      out.push({ url, title, description });
+    }
+    return out;
+  });
+}
+
+// Strip Google's leading-date noise + trailing "Read more" link text.
+// Matches:
+//   "Jul 1, 2025 — …"      "Apr 30, 2024 — …"
+//   "Aug 31, 2023 · …"     "1 day ago · …"
+//   "Yesterday — …"        "Today · …"
+function cleanDescription(desc) {
+  if (!desc) return '';
+  let s = String(desc);
+  // Leading absolute date: "Month D, YYYY <separator>" — separators we've
+  // seen are em-dash —, en-dash –, hyphen -, middle-dot ·.
+  s = s.replace(/^([A-Z][a-z]+\.?)\s+\d{1,2},?\s+\d{4}\s*[—–·\-]\s*/, '');
+  // Leading relative date: "N units ago <separator>"
+  s = s.replace(/^\d+\s+(day|days|hour|hours|minute|minutes|week|weeks|month|months|year|years)\s+ago\s*[—–·\-]?\s*/i, '');
+  // Leading "Yesterday — " / "Today · "
+  s = s.replace(/^(yesterday|today)\s*[—–·\-]\s*/i, '');
+  // Trailing "…Read more" link text
+  s = s.replace(/\s*…?\s*Read more\s*$/i, '');
+  return s.trim();
+}
+
+// Given the parsed SERP results + the full page HTML, build a unified list
+// of email records each carrying its source-result context (title / url /
+// description). Descriptions are cleaned (dates + "Read more" stripped).
+function buildEmailRecords(serpResults, pageHtml, pageUrl) {
+  const out = [];
+  const seenPerPage = new Set();
+
+  // Pass 1 — per-result emails (high-confidence, since Google chose to
+  // surface the snippet because it matched the query).
+  for (const r of serpResults) {
+    const cleanedDesc = cleanDescription(r.description);
+    const descEmails = extractFromText(cleanedDesc);
+    const titleEmails = extractFromText(r.title);
+    const all = new Set([...descEmails, ...titleEmails]);
+    for (const email of all) {
+      const inDesc = cleanedDesc && cleanedDesc.toLowerCase().includes(email);
+      out.push({
+        email,
+        title: r.title,
+        url: r.url,
+        description: cleanedDesc,
+        in_text: !!inDesc,
+        context: inDesc ? 'description' : 'title',
+      });
+      seenPerPage.add(email);
+    }
+  }
+
+  // Pass 2 — emails in the rest of the page HTML that didn't already land
+  // in pass 1 (footers, knowledge panels, embedded widgets, etc.).
+  const pageEmails = extractFromHtml(pageHtml, pageUrl);
+  for (const e of pageEmails) {
+    if (seenPerPage.has(e.email)) continue;
+    out.push({
+      email: e.email,
+      title: '',
+      url: '',
+      description: '',
+      in_text: false,
+      context: `page-${e.context || 'html'}`,
+    });
+    seenPerPage.add(e.email);
+  }
+  return out;
+}
 
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -115,8 +224,7 @@ async function runJob(jobConfig, { onLog, onProgress, onEmails, isCancelled, isP
     querySuffix = '',
     proxyUrl = '',
     proxyStickySession = false,
-    captchaProvider = 'manual',
-    captchaApiKey = process.env.TWOCAPTCHA_API_KEY || '',
+    maxSerpPages = 10,
   } = jobConfig;
 
   const log = (msg) => onLog?.(`[scraper] ${msg}`);
@@ -172,7 +280,14 @@ async function runJob(jobConfig, { onLog, onProgress, onEmails, isCancelled, isP
 
   try {
     for (let qi = 0; qi < queries.length; qi++) {
-      const q = queries[qi];
+      const rawQ = queries[qi];
+      // Queries can be plain strings OR { query, pages } objects (when the
+      // uploaded CSV has an optional Pages column).
+      const q = typeof rawQ === 'string' ? rawQ : (rawQ && rawQ.query) || '';
+      const queryPagesCap = (rawQ && typeof rawQ.pages === 'number' && rawQ.pages > 0)
+        ? Math.min(rawQ.pages, MAX_SERP_PAGES)
+        : Math.min(maxSerpPages || 10, MAX_SERP_PAGES);
+      if (!q) { log(`[query ${qi + 1}/${queries.length}] empty — skipping`); tick(); continue; }
       if (isCancelled?.()) { log('cancelled'); break; }
       while (isPaused?.()) await sleep(500);
 
@@ -224,42 +339,40 @@ async function runJob(jobConfig, { onLog, onProgress, onEmails, isCancelled, isP
         continue; // move on to the next query — never abort the whole run
       }
 
-      // Paginate through the SERP, extracting emails from each page's HTML
-      // directly (snippets shown by Google contain the matching addresses for
-      // domain-targeted queries like "@adinstruments.com+marketing").
-      for (let p = 1; p <= MAX_SERP_PAGES; p++) {
+      // Paginate through the SERP up to this query's page cap, extracting
+      // per-result {title, url, description} + emails from each result.
+      log(`[query ${qi + 1}/${queries.length}] page cap: ${queryPagesCap}`);
+      for (let p = 1; p <= queryPagesCap; p++) {
         if (isCancelled?.()) break;
         while (isPaused?.()) await sleep(500);
 
-        // Captcha detection + solve / manual wait
-        const captcha = await detectCaptcha(page);
-        if (captcha) {
-          log(`google captcha (${captcha.type}) — attempting solve`);
-          await maybeSolve(page, { provider: captchaProvider, apiKey: captchaApiKey, log });
+        // Captcha block? With rotating proxies just bail on this query and
+        // let the next query land on a fresh IP. No solver, no manual wait.
+        if (isGoogleBlock(page)) {
+          log(`page ${p}: Google /sorry/ block — abandoning query, next query gets a different IP`);
+          break;
         }
 
-        // Belt 1: wait for the initial paint + any XHRs Google fires before
-        // it considers the SERP "done".
+        // Wait for SERP to settle (initial paint + Google's late XHRs).
         await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
         await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-
-        // Scroll the rest of the way so the "Next" link is in view (fast).
         await scrollToPagination(page, { log: (m) => log(m) });
-
-        // Belt 2: a final settle wait — covers any late re-render that the
-        // scroll itself might have triggered. With both belts in place we
-        // never grab the HTML "too early".
         await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
 
-        // Extract from the main SERP document.
         const pageUrl = page.url();
         let html = '';
         try { html = await page.content(); }
         catch (err) { log(`content failed on page ${p}: ${err.message}`); }
-        const pageEmails = extractFromHtml(html, pageUrl);
 
-        // Belt 3: also sweep any iframes embedded on the SERP (rare on
-        // Google, but a few queries surface oneboxes / panels in iframes).
+        // Per-result parse: title / url / description for every SERP result
+        // block on the page.
+        const serpResults = await extractSerpResults(page).catch(() => []);
+        log(`page ${p}: ${serpResults.length} SERP result block(s) parsed`);
+
+        // Cross-reference: extract emails per result + from page chrome.
+        const records = buildEmailRecords(serpResults, html, pageUrl);
+
+        // Iframe sweep (rare, but cheap — keep it).
         for (const frame of page.frames()) {
           if (frame === page.mainFrame()) continue;
           try {
@@ -268,21 +381,27 @@ async function runJob(jobConfig, { onLog, onProgress, onEmails, isCancelled, isP
             const fEmails = extractFromHtml(fHtml, frame.url() || pageUrl);
             if (fEmails.length) {
               log(`+${fEmails.length} from iframe ${(frame.url() || '').slice(0, 60)}`);
-              pageEmails.push(...fEmails);
+              for (const e of fEmails) {
+                records.push({
+                  email: e.email, title: '', url: '', description: '',
+                  in_text: false, context: `iframe-${e.context || 'html'}`,
+                });
+              }
             }
           } catch {}
         }
 
-        if (pageEmails.length) {
-          log(`page ${p}: ${pageEmails.length} email candidate(s)`);
-          queryEmails.push(...pageEmails.map((e) => ({ ...e, query: q })));
+        if (records.length) {
+          log(`page ${p}: ${records.length} email candidate(s) (${records.filter((r) => r.in_text).length} in-text)`);
+          queryEmails.push(...records.map((e) => ({ ...e, query: q })));
           if (onEmails) {
             try {
               onEmails({
                 query: q,
                 sourceUrl: pageUrl,
                 sourceTitle: `SERP page ${p}`,
-                emails: pageEmails,
+                serpPage: p,
+                emails: records,
               });
             } catch (cbErr) { log(`onEmails callback error: ${cbErr.message}`); }
           }

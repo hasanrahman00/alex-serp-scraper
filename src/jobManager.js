@@ -6,10 +6,10 @@ const { v4: uuid } = require('uuid');
 const { EventEmitter } = require('events');
 const { parse: parseCsv } = require('csv-parse/sync');
 const { runJob } = require('./scraper');
-const { validateEmails } = require('./deepseek');
 const { dedupeAndScore } = require('./emailExtractor');
 const settings = require('./settings');
 const browser = require('./browser');
+const proxy = require('./proxy');
 const { JobCsvAppender } = require('./csvAppender');
 
 const JOBS_DIR = path.join(__dirname, '..', 'data', 'jobs');
@@ -111,7 +111,7 @@ class JobManager extends EventEmitter {
     // Open the per-job live CSV right at start so any crash mid-scrape still
     // leaves a usable file on disk. Header is written only the first time.
     const liveCsv = new JobCsvAppender(job.id, [
-      'timestamp', 'query', 'email', 'context', 'source_url', 'page_title',
+      'query', 'email', 'title', 'url', 'description', 'serp_page',
     ]);
     job.liveCsvPath = liveCsv.path;
     onLog(`[live-csv] streaming results to ${liveCsv.path}`);
@@ -138,8 +138,7 @@ class JobManager extends EventEmitter {
     }
     job.liveEmailCount = seenEmails.size;
 
-    const onEmails = ({ query, sourceUrl, sourceTitle, emails }) => {
-      const ts = new Date().toISOString();
+    const onEmails = ({ query, sourceUrl, sourceTitle, serpPage, emails }) => {
       let added = 0;
       const justAdded = [];
       for (const e of emails) {
@@ -148,12 +147,12 @@ class JobManager extends EventEmitter {
         if (seenEmails.has(key)) continue;
         seenEmails.add(key);
         liveCsv.append({
-          timestamp: ts,
           query,
           email: e.email,
-          context: e.context || '',
-          source_url: sourceUrl,
-          page_title: sourceTitle || '',
+          title: e.title || '',
+          url: e.url || '',
+          description: (e.description || '').slice(0, 500), // truncate long snippets
+          serp_page: serpPage != null ? `page ${serpPage}` : (sourceTitle || ''),
         });
         added++;
         if (justAdded.length < 10) justAdded.push(e.email);
@@ -179,10 +178,30 @@ class JobManager extends EventEmitter {
           querySuffix: s.querySuffix || '',
           proxyUrl: s.proxyUrl || '',
           proxyStickySession: !!s.proxyStickySession,
-          captchaProvider: s.captchaProvider || 'manual',
-          captchaApiKey: s.captchaApiKey || process.env.TWOCAPTCHA_API_KEY || '',
+          maxSerpPages: parseInt(s.maxSerpPages, 10) || 10,
           ...job.config,
         };
+
+        // ─── Proxy preflight ─────────────────────────────────────────────
+        // If a proxy is configured, probe it once via api.ipify.org. If the
+        // probe fails (out of bandwidth → 402, dead, wrong creds, etc.), drop
+        // the proxy from this run and fall back to the local network
+        // connection so the job can still proceed. This means a borked proxy
+        // never silently breaks 478 queries — worst case it costs 5 s of
+        // preflight time and you get a clear log line.
+        if (runConfig.proxyUrl) {
+          try {
+            const probe = await proxy.testProxy({ url: runConfig.proxyUrl, timeoutMs: 5000 });
+            onLog(`[proxy] preflight OK · egress IP ${probe.ip}`);
+          } catch (err) {
+            onLog(`[proxy] preflight FAILED: ${err.message}`);
+            onLog(`[proxy] falling back to LOCAL NETWORK connection (no proxy) for this run`);
+            runConfig.proxyUrl = '';
+            try { await proxy.stop(); } catch {}
+          }
+        } else {
+          onLog('[proxy] not configured — using LOCAL NETWORK connection');
+        }
 
         // Auto-attach: reuse cached endpoint, otherwise probe the port; if Chrome
         // isn't there, launch it from the configured chromePath / userDataDir.
@@ -197,16 +216,17 @@ class JobManager extends EventEmitter {
               if (!s.chromePath) {
                 onLog('[browser] Chrome not running and no executable path configured — falling back to bundled Chromium');
               } else {
-                onLog(`[browser] no Chrome on port ${s.debugPort} — launching ${s.chromePath}${s.proxyUrl ? ' (with proxy)' : ''}`);
+                const effectiveProxy = runConfig.proxyUrl || '';
+                onLog(`[browser] no Chrome on port ${s.debugPort} — launching ${s.chromePath}${effectiveProxy ? ' (with proxy)' : ' (direct connection)'}`);
                 try {
                   const launched = await browser.launch({
                     chromePath: s.chromePath,
                     userDataDir: s.userDataDir,
                     debugPort: s.debugPort,
-                    proxyUrl: s.proxyUrl || '',
+                    proxyUrl: effectiveProxy,
                   });
                   endpoint = launched.endpoint;
-                  onLog(`[browser] launched · pid=${launched.pid || 'n/a'} · ${endpoint}${launched.proxy ? ` · proxy ${launched.proxy}` : ''}`);
+                  onLog(`[browser] launched · pid=${launched.pid || 'n/a'} · ${endpoint}${launched.proxy ? ` · proxy ${launched.proxy}` : ' · direct'}`);
                 } catch (err) {
                   onLog(`[browser] launch failed: ${err.message} — falling back to bundled Chromium`);
                 }
@@ -226,10 +246,9 @@ class JobManager extends EventEmitter {
         const dedupedEmails = dedupeAndScore(allCandidates);
         onLog(`merged into ${dedupedEmails.length} unique email candidates across all queries`);
 
-        const apiKey = job.config.deepseekApiKey || process.env.DEEPSEEK_API_KEY || '';
-        const validated = await validateEmails(dedupedEmails, { apiKey, log: onLog });
-        job.validated = validated;
-        onLog(`DeepSeek validation done: ${validated.filter((v) => v.real).length} marked real / ${validated.length} total`);
+        // No DeepSeek validation — relying on the proxy + regex filters only.
+        // Keep job.validated as an empty array for backward UI compatibility.
+        job.validated = [];
 
         job.status = job._control.cancelled ? 'cancelled' : 'completed';
         job.finishedAt = Date.now();

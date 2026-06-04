@@ -32,24 +32,28 @@ app.get('/api/health', async (_req, res) => {
   let cdpStatus;
   try { cdpStatus = await browser.status({ debugPort: s.debugPort }); }
   catch { cdpStatus = { connected: false }; }
-  const captchaConfigured = s.captchaProvider !== 'manual' && !!s.captchaApiKey;
   res.json({
     ok: true,
-    deepseek: !!process.env.DEEPSEEK_API_KEY,
-    captcha: captchaConfigured,
-    captchaProvider: s.captchaProvider,
     cdp: cdpStatus.connected,
     cdpEndpoint: cdpStatus.endpoint || null,
+    proxy: !!s.proxyUrl,
   });
 });
 
 /* ------------ settings ------------ */
 app.get('/api/settings', (_req, res) => {
-  res.json(settings.load());
+  res.json({ ...settings.load(), _envSourced: settings.envSourcedKeys() });
 });
 app.post('/api/settings', (req, res) => {
-  try { res.json(settings.save(req.body || {})); }
-  catch (e) { res.status(400).json({ error: e.message }); }
+  try {
+    // Don't let the UI write keys that are pinned by .env — env always
+    // wins on the next load() anyway, but stripping here avoids the user
+    // thinking they saved something they didn't.
+    const env = new Set(settings.envSourcedKeys());
+    const patch = { ...(req.body || {}) };
+    for (const k of env) delete patch[k];
+    res.json({ ...settings.save(patch), _envSourced: [...env] });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 /* ------------ browser ------------ */
@@ -168,9 +172,39 @@ app.get('/api/jobs/:id/export.json', (req, res) => {
 });
 
 /* ------------ upload (csv / xlsx / xls / json) ------------ */
+const norm = (s) => String(s || '').toLowerCase().trim();
+function pickColumn(keys, ...wantedNames) {
+  for (const want of wantedNames) {
+    const found = keys.find((k) => norm(k) === norm(want));
+    if (found) return found;
+  }
+  return null;
+}
 function pickQueryColumn(keys) {
-  const norm = (s) => String(s || '').toLowerCase().trim();
-  return keys.find((k) => norm(k) === 'query') || keys[0];
+  return pickColumn(keys, 'query') || keys[0];
+}
+function pickPagesColumn(keys) {
+  return pickColumn(keys, 'pages', 'maxpages', 'max_pages', 'depth');
+}
+
+// Build the final queries array: plain strings if no Pages column, OR
+// { query, pages } objects when the row specifies a custom page depth.
+function buildQueries(rows, queryCol, pagesCol) {
+  const out = [];
+  const seen = new Set();
+  for (const r of rows) {
+    const q = String(r[queryCol] ?? '').trim();
+    if (!q || seen.has(q)) continue;
+    seen.add(q);
+    let pages = null;
+    if (pagesCol) {
+      const raw = r[pagesCol];
+      const n = parseInt(raw, 10);
+      if (Number.isFinite(n) && n > 0) pages = n;
+    }
+    out.push(pages ? { query: q, pages } : q);
+  }
+  return out;
 }
 
 app.post('/api/upload', upload.single('file'), (req, res) => {
@@ -179,6 +213,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   const baseName = req.file.originalname.replace(/\.[^.]+$/, '');
   let queries = [];
   let columnUsed = null;
+  let pagesColumnUsed = null;
 
   try {
     if (ext === 'xlsx' || ext === 'xls') {
@@ -186,18 +221,22 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
       const sheet = wb.Sheets[wb.SheetNames[0]];
       const rows = xlsx.utils.sheet_to_json(sheet, { defval: '' });
       if (rows.length) {
-        columnUsed = pickQueryColumn(Object.keys(rows[0]));
-        queries = rows.map((r) => r[columnUsed]).filter(Boolean);
+        const keys = Object.keys(rows[0]);
+        columnUsed = pickQueryColumn(keys);
+        pagesColumnUsed = pickPagesColumn(keys);
+        queries = buildQueries(rows, columnUsed, pagesColumnUsed);
       }
     } else if (ext === 'json') {
       const buf = fs.readFileSync(req.file.path, 'utf8');
       const data = JSON.parse(buf);
       if (Array.isArray(data)) {
         if (data.every((x) => typeof x === 'string')) {
-          queries = data;
+          queries = [...new Set(data.map((s) => String(s).trim()).filter(Boolean))];
         } else if (data.length) {
-          columnUsed = pickQueryColumn(Object.keys(data[0]));
-          queries = data.map((r) => r[columnUsed]).filter(Boolean);
+          const keys = Object.keys(data[0]);
+          columnUsed = pickQueryColumn(keys);
+          pagesColumnUsed = pickPagesColumn(keys);
+          queries = buildQueries(data, columnUsed, pagesColumnUsed);
         }
       } else if (Array.isArray(data.queries)) {
         queries = data.queries;
@@ -206,12 +245,14 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
       const buf = fs.readFileSync(req.file.path, 'utf8');
       const records = parseCsv(buf, { columns: true, skip_empty_lines: true, trim: true });
       if (records.length) {
-        columnUsed = pickQueryColumn(Object.keys(records[0]));
-        queries = records.map((r) => r[columnUsed]).filter(Boolean);
+        const keys = Object.keys(records[0]);
+        columnUsed = pickQueryColumn(keys);
+        pagesColumnUsed = pickPagesColumn(keys);
+        queries = buildQueries(records, columnUsed, pagesColumnUsed);
       }
       if (queries.length === 0) {
         const flat = parseCsv(buf, { skip_empty_lines: true, trim: true });
-        queries = flat.flat().filter(Boolean);
+        queries = [...new Set(flat.flat().map((s) => String(s).trim()).filter(Boolean))];
       }
     }
   } catch (err) {
@@ -220,14 +261,19 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     fs.unlink(req.file.path, () => {});
   }
 
-  queries = [...new Set(queries.map((s) => String(s).trim()).filter(Boolean))];
   if (!queries.length) {
     return res.status(400).json({ error: 'No queries found. Make sure your file has a "Query" column.' });
   }
 
   const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
   const suggestedName = `${baseName} — ${stamp}`;
-  res.json({ queries, count: queries.length, suggestedName, columnUsed });
+  res.json({
+    queries,
+    count: queries.length,
+    suggestedName,
+    columnUsed,
+    pagesColumnUsed,
+  });
 });
 
 /* ------------ websocket ------------ */
@@ -257,13 +303,16 @@ wss.on('connection', (ws) => {
 
 server.listen(PORT, () => {
   const s = settings.load();
+  const envKeys = new Set(settings.envSourcedKeys());
+  const proxySource = envKeys.has('proxyUrl') ? '.env' : (s.proxyUrl ? 'settings.json' : 'unset');
+  const stickySource = envKeys.has('proxyStickySession') ? '.env' : 'settings.json';
   console.log('');
   console.log(`  SERP Email Harvester  →  http://localhost:${PORT}`);
   console.log('  ' + '─'.repeat(60));
-  console.log(`  DeepSeek : ${process.env.DEEPSEEK_API_KEY ? 'configured' : 'NOT configured (set DEEPSEEK_API_KEY in .env)'}`);
-  console.log(`  2captcha : ${process.env.TWOCAPTCHA_API_KEY ? 'configured' : 'NOT configured (optional)'}`);
   console.log(`  Chrome   : ${s.chromePath || 'NOT FOUND — open Settings in the UI to set the path'}`);
   console.log(`  Profile  : ${s.userDataDir}`);
   console.log(`  CDP port : ${s.debugPort}`);
+  console.log(`  Proxy    : ${s.proxyUrl ? s.proxyUrl.replace(/:[^:@]+@/, ':***@') : '(unset)'}  [${proxySource}]`);
+  console.log(`  Sticky   : ${s.proxyStickySession ? 'on' : 'off'}  [${stickySource}]`);
   console.log('');
 });

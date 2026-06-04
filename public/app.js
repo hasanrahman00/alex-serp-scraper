@@ -43,23 +43,37 @@ function setDot(parentSel, on) {
   el.classList.add(on ? 'on' : 'off');
 }
 
+// Disable a settings input + show a "from .env" badge next to its label.
+function applyEnvLock(inputSel, locked) {
+  const input = $(inputSel);
+  if (!input) return;
+  input.disabled = !!locked;
+  input.classList.toggle('env-locked', !!locked);
+  // The label is the enclosing <label class="field|check"> — find its first <span>
+  const label = input.closest('label');
+  if (!label) return;
+  const labelSpan = label.querySelector('span');
+  if (!labelSpan) return;
+  const existing = labelSpan.querySelector('.env-badge');
+  if (locked && !existing) {
+    const b = document.createElement('span');
+    b.className = 'env-badge';
+    b.textContent = 'from .env';
+    labelSpan.appendChild(b);
+  } else if (!locked && existing) {
+    existing.remove();
+  }
+}
+
 /* -------- per-job derived stats --------
-   green  = real (DeepSeek-verified)
-   yellow = unverified (DeepSeek not run / null)
-   red    = not real (DeepSeek-rejected)
-   purple = total live unique extracted (raw, before validation)
-   orange = failed queries (nav errors, no results)
+   green  = live unique emails extracted
+   orange = failed queries (nav errors, /sorry/ blocks, no results)
 */
 function computeStats(j) {
   const totalQueries = (j.config?.queries || []).length;
-  const validated = j.validated || [];
-  const real = validated.filter((v) => v.real === true).length;
-  const notReal = validated.filter((v) => v.real === false).length;
-  const unverified = validated.filter((v) => v.real === null || v.real === undefined).length;
   const liveUnique = j.liveEmailCount || 0;
-  // Failed queries: results entries with no emails (run completed) OR with explicit error
   const failed = (j.results || []).filter((r) => r.error || (Array.isArray(r.emails) && r.emails.length === 0)).length;
-  return { totalQueries, real, notReal, unverified, liveUnique, failed };
+  return { totalQueries, liveUnique, failed };
 }
 
 /* -------- job row rendering -------- */
@@ -92,10 +106,7 @@ function renderJobRow(j) {
 
     <div class="stats">
       <span class="${cls(stats.liveUnique, 'green')}" title="Unique emails extracted (live)">${stats.liveUnique.toLocaleString()}</span>
-      <span class="${cls(stats.real, 'yellow')}" title="DeepSeek-verified real">${stats.real.toLocaleString()}</span>
-      <span class="${cls(stats.notReal, 'red')}" title="DeepSeek-rejected">${stats.notReal.toLocaleString()}</span>
-      <span class="${cls(stats.unverified, 'purple')}" title="Unverified (DeepSeek not run / no answer)">${stats.unverified.toLocaleString()}</span>
-      <span class="${cls(stats.failed, 'orange')}" title="Failed queries (nav errors / no results)">${stats.failed.toLocaleString()}</span>
+      <span class="${cls(stats.failed, 'orange')}" title="Failed queries (nav errors / /sorry/ blocks / no results)">${stats.failed.toLocaleString()}</span>
     </div>
 
     <div class="row-actions" data-id="${j.id}"></div>
@@ -123,14 +134,8 @@ function renderJobRow(j) {
     actions.appendChild(mkBtn(j.status === 'queued' ? 'Start' : 'Re-run', 'ghost', () => doStart(j.id)));
   }
 
-  // Download = Live CSV (most useful)
-  actions.appendChild(mkBtn('Download', 'success', () => downloadLive(j.id), 'Download Live CSV (raw extracted)'));
-
-  // "Issues" with badge = Validated CSV (real-count badge)
-  if (stats.real > 0) {
-    actions.appendChild(mkBtn(`Validated <span class="badge">${stats.real}</span>`, 'warn', () => downloadValidated(j.id), 'Download validated CSV (real emails only)'));
-  }
-
+  // Download = Live CSV (the only output now — no DeepSeek post-processing)
+  actions.appendChild(mkBtn('Download', 'success', () => downloadLive(j.id), 'Download Live CSV (deduped extracted emails)'));
   actions.appendChild(mkBtn('Logs', 'ghost', () => openLogsModal(j.id)));
   actions.appendChild(mkBtn('Delete', 'danger', () => doDelete(j.id)));
 
@@ -171,7 +176,6 @@ async function doDelete(id) {
   } catch (e) { toast(e.message, 'error'); }
 }
 function downloadLive(id) { window.open(`/api/jobs/${id}/live.csv`, '_blank'); }
-function downloadValidated(id) { window.open(`/api/jobs/${id}/export.csv?onlyReal=true`, '_blank'); }
 
 /* -------- logs modal -------- */
 function openLogsModal(jobId) {
@@ -244,12 +248,15 @@ async function openSettings() {
     $('#set-debugPort').value = s.debugPort || 9222;
     $('#set-proxyUrl').value = s.proxyUrl || '';
     $('#set-proxyStickySession').checked = !!s.proxyStickySession;
+    // Lock fields that are pinned by .env so users can see (but not edit)
+    // them. The badge next to each field explains where the value comes from.
+    const envKeys = new Set(s._envSourced || []);
+    applyEnvLock('#set-proxyUrl', envKeys.has('proxyUrl'));
+    applyEnvLock('#set-proxyStickySession', envKeys.has('proxyStickySession'));
     $('#set-pageDelayMin').value = s.pageDelayMin || 1500;
     $('#set-pageDelayMax').value = s.pageDelayMax || 4000;
     $('#set-querySuffix').value = s.querySuffix == null ? 'email' : s.querySuffix;
-    $('#set-captchaProvider').value = s.captchaProvider || 'manual';
-    $('#set-captchaApiKey').value = s.captchaApiKey || '';
-    updateCaptchaKeyVisibility();
+    $('#set-maxSerpPages').value = s.maxSerpPages || 10;
     await refreshBrowserStatus();
     await refreshProxyStatus();
     $('#settingsModal').classList.remove('hidden');
@@ -327,14 +334,8 @@ function readSettingsForm() {
     pageDelayMin: parseInt($('#set-pageDelayMin').value, 10) || 0,
     pageDelayMax: parseInt($('#set-pageDelayMax').value, 10) || 0,
     querySuffix: $('#set-querySuffix').value.trim(),
-    captchaProvider: $('#set-captchaProvider').value,
-    captchaApiKey: $('#set-captchaApiKey').value.trim(),
+    maxSerpPages: Math.min(Math.max(parseInt($('#set-maxSerpPages').value, 10) || 10, 1), 20),
   };
-}
-
-function updateCaptchaKeyVisibility() {
-  const isManual = $('#set-captchaProvider').value === 'manual';
-  $('#captchaKeyField').style.display = isManual ? 'none' : '';
 }
 
 async function saveSettings() {
@@ -357,9 +358,8 @@ async function stopBrowser() {
 async function loadHealth() {
   try {
     const h = await api('/api/health');
-    setDot('#status-deepseek', h.deepseek);
-    setDot('#status-captcha', h.captcha);
     setDot('#status-cdp', h.cdp);
+    setDot('#status-proxy', h.proxy);
   } catch {}
 }
 
@@ -420,7 +420,6 @@ function bindUI() {
   $('#saveSettings').addEventListener('click', saveSettings);
   $('#stopBrowserBtn').addEventListener('click', stopBrowser);
   $('#testProxyBtn').addEventListener('click', testProxy);
-  $('#set-captchaProvider').addEventListener('change', updateCaptchaKeyVisibility);
 
   // Logs modal
   $('#closeLogsModal').addEventListener('click', closeLogsModal);

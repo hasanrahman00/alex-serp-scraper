@@ -75,18 +75,19 @@ async function launch({ chromePath, userDataDir, debugPort, proxyUrl = '' }) {
   if (!fs.existsSync(chromePath)) throw new Error(`Chrome not found at ${chromePath}`);
   if (!debugPort) throw new Error('Debug port not set');
 
-  // PROXY-CONFIGURED + UN-OWNED CHROME RECOVERY
-  // If a proxy is required and we don't have a handle to the running Chrome
-  // (typical case: server restarted via nodemon while Chrome stayed up), the
-  // existing Chrome was launched WITHOUT --proxy-server and we can't change
-  // that without restarting it. Kill whatever is on the port at the OS
-  // level, then fall through to a fresh spawn.
-  if (proxyUrl) {
+  // EXTERNAL-CHROME-MISMATCH RECOVERY
+  // If we don't own the running Chrome (nodemon restart, manually launched,
+  // etc.) AND the proxy state we want doesn't match what it was launched
+  // with, the only fix is to kill it at the OS level and respawn. Cases:
+  //   - want proxy, existing Chrome has no --proxy-server  → kill & respawn
+  //   - want no proxy, existing Chrome has stale dead --proxy-server → kill
+  //   - same proxy state as last launch → fine, fall through to reuse below
+  const stateChanged = (!!proxyUrl) !== (!!lastProxyUrl);
+  if (!chromeProcess && stateChanged) {
     try {
       await getCdpFromPort(debugPort);
       const killed = killByPort(debugPort);
       if (killed > 0) {
-        // Wait for the port to be released before spawning a new Chrome.
         for (let i = 0; i < 25; i++) {
           await sleep(300);
           let stillBound = true;
