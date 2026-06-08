@@ -27,13 +27,22 @@
       <label class="dropzone" id="dropzone">
         <input type="file" id="fileInput" accept=".csv,.xlsx,.xls,.json" hidden />
         <div class="dropzone-inner">
-          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
-          <div>
-            <div class="dz-title">Drop CSV / XLSX / JSON, or <span class="link">browse</span></div>
-            <div class="dz-sub muted small">Required column: <code>Query</code> · optional: <code>Pages</code> (per-row depth) · auto-starts on upload</div>
+          <div class="dz-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+          </div>
+          <div class="dz-text">
+            <div class="dz-title">Drop a file, or <span class="link">browse</span></div>
+            <div class="dz-sub muted small">CSV · XLSX · JSON — needs a <code>Query</code> column · optional <code>Pages</code> per-row · auto-starts</div>
           </div>
         </div>
       </label>
+      <div class="upload-opts">
+        <div class="opt-control">
+          <span class="opt-label">SERP pages / query</span>
+          <input id="opt-maxPages" type="number" min="1" max="20" value="10" />
+        </div>
+        <span class="muted small opt-note">applies to this job (1–20) · a <code>Pages</code> column overrides per row</span>
+      </div>
     </section>
 
     <!-- Jobs section -->
@@ -50,7 +59,7 @@
 
   <!-- Settings modal -->
   <div class="modal-backdrop hidden" id="settingsModal">
-    <div class="modal">
+    <div class="modal modal-settings">
       <header class="modal-head">
         <h2>Settings</h2>
         <button class="icon-btn" id="closeSettings" aria-label="Close">
@@ -58,68 +67,126 @@
         </button>
       </header>
 
-      <div class="modal-body">
-        <section class="settings-section">
-          <h3>Browser (CDP)</h3>
-          <p class="muted small">When a job starts, the harvester auto-attaches to your Chrome on this port. If nothing is listening, it spawns Chrome from the executable below. Use a dedicated user-data-dir to avoid clashing with your normal profile.</p>
-          <label class="field">
-            <span>Chrome executable</span>
-            <input id="set-chromePath" type="text" placeholder="C:\Program Files\Google\Chrome\Application\chrome.exe" />
-          </label>
-          <label class="field">
-            <span>User data directory (profile)</span>
-            <input id="set-userDataDir" type="text" placeholder="C:\Users\you\chrome-profile" />
-          </label>
-          <label class="field">
-            <span>Debug port</span>
-            <input id="set-debugPort" type="number" min="1024" max="65535" />
-          </label>
-          <div class="status-line">
-            <span class="dot" id="modalCdpDot"></span>
-            <span id="modalCdpText">Disconnected</span>
-            <span class="grow"></span>
-            <button class="btn ghost small" id="stopBrowserBtn" title="Kill the Chrome process started by this app">Stop Chrome</button>
-          </div>
-        </section>
+      <div class="settings-layout">
+        <!-- Left rail -->
+        <nav class="settings-nav">
+          <button class="settings-tab active" data-tab="browser">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+            Browser
+          </button>
+          <button class="settings-tab" data-tab="proxy">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 3 21 3 21 8"></polyline><line x1="4" y1="20" x2="21" y2="3"></line><polyline points="21 16 21 21 16 21"></polyline><line x1="15" y1="15" x2="21" y2="21"></line><line x1="4" y1="4" x2="9" y2="9"></line></svg>
+            Proxy
+          </button>
+          <button class="settings-tab" data-tab="crawler">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+            Crawler
+          </button>
+        </nav>
 
-        <section class="settings-section">
-          <h3>Proxy</h3>
-          <p class="muted small">Rotating residential proxy (Webshare, IPRoyal, etc.). A small local proxy-chain server handles authentication so Chrome doesn't pop a 407 dialog. Format: <code>http://USER:PASS@HOST:PORT</code> · leave blank to scrape from your own IP.</p>
-          <label class="field">
-            <span>Proxy URL</span>
-            <input id="set-proxyUrl" type="text" placeholder="http://krazblud-US-rotate:****@p.webshare.io:80" autocomplete="off" />
-          </label>
-          <label class="check" title="Each query gets a dedicated IP for its full pagination, then a fresh one for the next query. Requires a paid plan on Webshare, or any IPRoyal / NodeMaven plan. Webshare FREE rejects this with HTTP 590 — leave OFF on free tier.">
-            <input id="set-proxyStickySession" type="checkbox" />
-            <span>Sticky session per query <span class="muted small">— paid plan only · auto-disables on 590</span></span>
-          </label>
-          <div class="status-line">
-            <span class="dot" id="modalProxyDot"></span>
-            <span id="modalProxyText">No proxy configured</span>
-            <span class="grow"></span>
-            <button class="btn ghost small" id="testProxyBtn" title="Hit api.ipify.org through the proxy and show the egress IP">Test proxy</button>
-          </div>
-        </section>
+        <!-- Content -->
+        <div class="settings-content">
+          <!-- Browser -->
+          <section class="settings-panel active" data-panel="browser">
+            <div class="panel-intro">
+              <h3>Browser connection</h3>
+              <p class="muted small">The scraper drives your real Chrome over the DevTools protocol — auto-attaching to this port, or launching Chrome from the path below if nothing's there.</p>
+            </div>
+            <div class="field-group">
+              <label class="field">
+                <span class="field-label">Chrome executable</span>
+                <input id="set-chromePath" type="text" placeholder="C:\Program Files\Google\Chrome\Application\chrome.exe" spellcheck="false" />
+              </label>
+              <label class="field">
+                <span class="field-label">User-data directory <span class="field-hint">dedicated profile</span></span>
+                <input id="set-userDataDir" type="text" placeholder="...\data\chrome-profile" spellcheck="false" />
+              </label>
+              <label class="field field-narrow">
+                <span class="field-label">Debug port</span>
+                <input id="set-debugPort" type="number" min="1024" max="65535" />
+              </label>
+            </div>
+            <div class="status-row-box">
+              <span class="dot" id="modalCdpDot"></span>
+              <span id="modalCdpText">Disconnected</span>
+              <span class="grow"></span>
+              <button class="btn ghost small" id="stopBrowserBtn" title="Kill the Chrome process started by this app">Stop Chrome</button>
+            </div>
+          </section>
 
-        <section class="settings-section">
-          <h3>Crawler</h3>
-          <p class="muted small">Each query paginates through up to <code>Max SERP pages</code> result pages and extracts emails per result block — capturing the title, URL, and snippet description alongside each address. Override per-query by adding a <code>Pages</code> column to your CSV.</p>
-          <label class="field">
-            <span>Query suffix <span class="muted">(appended to every CSV row before searching)</span></span>
-            <input id="set-querySuffix" type="text" placeholder='e.g. "email" — leave blank to disable' />
-          </label>
-          <div class="grid-2">
-            <label class="field"><span>Max SERP pages per query</span><input id="set-maxSerpPages" type="number" min="1" max="20" /></label>
-            <label class="field"><span></span><span class="muted small">hard ceiling is 20</span></label>
-          </div>
-          <div class="grid-2">
-            <label class="field"><span>Delay min (ms)</span><input id="set-pageDelayMin" type="number" min="0" /></label>
-            <label class="field"><span>Delay max (ms)</span><input id="set-pageDelayMax" type="number" min="0" /></label>
-          </div>
-        </section>
+          <!-- Proxy -->
+          <section class="settings-panel" data-panel="proxy">
+            <div class="panel-intro">
+              <h3>Proxy</h3>
+              <p class="muted small">Rotating residential proxy (Webshare, IPRoyal…). Copy these straight off your provider's proxy page. Leave <b>Host</b> blank to scrape from your own IP.</p>
+            </div>
+            <div class="field-group">
+              <div class="field-row">
+                <label class="field field-protocol">
+                  <span class="field-label">Protocol</span>
+                  <select id="set-proxyProtocol">
+                    <option value="http">HTTP</option>
+                    <option value="https">HTTPS</option>
+                  </select>
+                </label>
+                <label class="field field-grow">
+                  <span class="field-label">Host</span>
+                  <input id="set-proxyHost" type="text" placeholder="p.webshare.io" autocomplete="off" spellcheck="false" />
+                </label>
+                <label class="field field-port">
+                  <span class="field-label">Port</span>
+                  <input id="set-proxyPort" type="text" placeholder="80" autocomplete="off" spellcheck="false" />
+                </label>
+              </div>
+              <div class="field-row">
+                <label class="field field-grow">
+                  <span class="field-label">Username</span>
+                  <input id="set-proxyUsername" type="text" placeholder="krazblud-rotate" autocomplete="off" spellcheck="false" />
+                </label>
+                <label class="field field-grow">
+                  <span class="field-label">Password</span>
+                  <div class="input-with-action">
+                    <input id="set-proxyPassword" type="password" placeholder="••••••••••" autocomplete="off" spellcheck="false" />
+                    <button type="button" class="input-action" id="toggleProxyPw" title="Show / hide" aria-label="Show password">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                    </button>
+                  </div>
+                </label>
+              </div>
+              <label class="toggle-row">
+                <input id="set-proxyStickySession" type="checkbox" />
+                <span class="toggle-label">
+                  <span>Sticky session per query</span>
+                  <span class="field-hint">One dedicated IP for each query's full pagination — paid plans only · auto-disables on HTTP 590</span>
+                </span>
+              </label>
+            </div>
+            <div class="status-row-box">
+              <span class="dot" id="modalProxyDot"></span>
+              <span id="modalProxyText">No proxy configured</span>
+              <span class="grow"></span>
+              <button class="btn ghost small" id="testProxyBtn" title="Hit api.ipify.org through the proxy and show the egress IP">Test proxy</button>
+            </div>
+          </section>
+
+          <!-- Crawler -->
+          <section class="settings-panel" data-panel="crawler">
+            <div class="panel-intro">
+              <h3>Crawler</h3>
+              <p class="muted small">Emails are extracted per SERP result block — capturing the title, URL, and snippet alongside each address. Page depth is chosen per job at upload (a <code>Pages</code> column overrides it per row).</p>
+            </div>
+            <div class="field-group">
+              <label class="field">
+                <span class="field-label">Query suffix <span class="field-hint">appended to every query before searching</span></span>
+                <input id="set-querySuffix" type="text" placeholder='e.g. "email" — leave blank to disable' />
+              </label>
+            </div>
+          </section>
+        </div>
       </div>
 
       <footer class="modal-foot">
+        <span class="foot-note muted small">Saved settings apply to the next job you start.</span>
         <button class="btn ghost" id="cancelSettings">Cancel</button>
         <button class="btn primary" id="saveSettings">Save</button>
       </footer>

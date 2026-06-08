@@ -43,28 +43,6 @@ function setDot(parentSel, on) {
   el.classList.add(on ? 'on' : 'off');
 }
 
-// Disable a settings input + show a "from .env" badge next to its label.
-function applyEnvLock(inputSel, locked) {
-  const input = $(inputSel);
-  if (!input) return;
-  input.disabled = !!locked;
-  input.classList.toggle('env-locked', !!locked);
-  // The label is the enclosing <label class="field|check"> — find its first <span>
-  const label = input.closest('label');
-  if (!label) return;
-  const labelSpan = label.querySelector('span');
-  if (!labelSpan) return;
-  const existing = labelSpan.querySelector('.env-badge');
-  if (locked && !existing) {
-    const b = document.createElement('span');
-    b.className = 'env-badge';
-    b.textContent = 'from .env';
-    labelSpan.appendChild(b);
-  } else if (!locked && existing) {
-    existing.remove();
-  }
-}
-
 /* -------- per-job derived stats --------
    green  = live unique emails extracted
    orange = failed queries (nav errors, /sorry/ blocks, no results)
@@ -226,10 +204,13 @@ async function handleFile(file) {
 
   toast(`Loaded ${parsed.count} queries — starting job…`, 'success');
   const name = parsed.suggestedName || file.name;
+  // Per-JOB SERP page depth (chosen above the dropzone). A "Pages" CSV column
+  // still overrides this per row inside the scraper.
+  const maxSerpPages = Math.min(Math.max(parseInt($('#opt-maxPages').value, 10) || 10, 1), 20);
   try {
     const j = await api('/api/jobs', {
       method: 'POST',
-      body: JSON.stringify({ name, queries: parsed.queries }),
+      body: JSON.stringify({ name, queries: parsed.queries, maxSerpPages }),
     });
     state.jobs.set(j.id, j);
     await api(`/api/jobs/${j.id}/start`, { method: 'POST' });
@@ -246,17 +227,16 @@ async function openSettings() {
     $('#set-chromePath').value = s.chromePath || '';
     $('#set-userDataDir').value = s.userDataDir || '';
     $('#set-debugPort').value = s.debugPort || 9222;
-    $('#set-proxyUrl').value = s.proxyUrl || '';
+    // Proxy — separate, fully-editable fields (mirrors a provider's Proxy List page).
+    $('#set-proxyProtocol').value = (s.proxyProtocol || 'http').toLowerCase();
+    $('#set-proxyHost').value = s.proxyHost || '';
+    $('#set-proxyPort').value = s.proxyPort || '';
+    $('#set-proxyUsername').value = s.proxyUsername || '';
+    $('#set-proxyPassword').value = s.proxyPassword || '';
     $('#set-proxyStickySession').checked = !!s.proxyStickySession;
-    // Lock fields that are pinned by .env so users can see (but not edit)
-    // them. The badge next to each field explains where the value comes from.
-    const envKeys = new Set(s._envSourced || []);
-    applyEnvLock('#set-proxyUrl', envKeys.has('proxyUrl'));
-    applyEnvLock('#set-proxyStickySession', envKeys.has('proxyStickySession'));
-    $('#set-pageDelayMin').value = s.pageDelayMin || 1500;
-    $('#set-pageDelayMax').value = s.pageDelayMax || 4000;
     $('#set-querySuffix').value = s.querySuffix == null ? 'email' : s.querySuffix;
-    $('#set-maxSerpPages').value = s.maxSerpPages || 10;
+    switchSettingsTab('browser');     // always open on the first tab
+    resetPasswordReveal();
     await refreshBrowserStatus();
     await refreshProxyStatus();
     $('#settingsModal').classList.remove('hidden');
@@ -268,6 +248,27 @@ function closeSettings() {
   $('#settingsModal').classList.add('hidden');
   clearInterval(settingsPollTimer);
   settingsPollTimer = null;
+}
+
+// Switch the active settings tab + panel.
+function switchSettingsTab(name) {
+  document.querySelectorAll('.settings-tab').forEach((t) =>
+    t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.settings-panel').forEach((p) =>
+    p.classList.toggle('active', p.dataset.panel === name));
+}
+
+// Show/hide the proxy password field.
+function togglePasswordReveal() {
+  const input = $('#set-proxyPassword');
+  const btn = $('#toggleProxyPw');
+  const reveal = input.type === 'password';
+  input.type = reveal ? 'text' : 'password';
+  btn.classList.toggle('revealed', reveal);
+}
+function resetPasswordReveal() {
+  $('#set-proxyPassword').type = 'password';
+  $('#toggleProxyPw').classList.remove('revealed');
 }
 
 async function refreshBrowserStatus() {
@@ -304,8 +305,8 @@ function shortHost(url) {
 }
 
 async function testProxy() {
-  const url = $('#set-proxyUrl').value.trim();
-  if (!url) { toast('Paste a proxy URL first', 'error'); return; }
+  const url = composeProxyUrlFromForm();
+  if (!url) { toast('Enter at least a proxy host first', 'error'); return; }
   $('#modalProxyText').textContent = 'Testing — fetching api.ipify.org through the chain…';
   $('#testProxyBtn').disabled = true;
   try {
@@ -324,17 +325,32 @@ async function testProxy() {
   }
 }
 
+// Build http://user:pass@host:port from the separate proxy fields (mirrors the
+// backend's composeProxyUrl). Empty when no host. Used by Save and Test.
+function composeProxyUrlFromForm() {
+  const host = $('#set-proxyHost').value.trim();
+  if (!host) return '';
+  const protocol = ($('#set-proxyProtocol').value || 'http').toLowerCase();
+  const port = $('#set-proxyPort').value.trim();
+  const user = $('#set-proxyUsername').value.trim();
+  const pass = $('#set-proxyPassword').value.trim();
+  const auth = (user || pass) ? `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@` : '';
+  const hostPort = port ? `${host}:${port}` : host;
+  return `${protocol}://${auth}${hostPort}`;
+}
+
 function readSettingsForm() {
   return {
     chromePath: $('#set-chromePath').value.trim(),
     userDataDir: $('#set-userDataDir').value.trim(),
     debugPort: parseInt($('#set-debugPort').value, 10) || 9222,
-    proxyUrl: $('#set-proxyUrl').value.trim(),
+    proxyProtocol: ($('#set-proxyProtocol').value || 'http').toLowerCase(),
+    proxyHost: $('#set-proxyHost').value.trim(),
+    proxyPort: $('#set-proxyPort').value.trim(),
+    proxyUsername: $('#set-proxyUsername').value.trim(),
+    proxyPassword: $('#set-proxyPassword').value.trim(),
     proxyStickySession: $('#set-proxyStickySession').checked,
-    pageDelayMin: parseInt($('#set-pageDelayMin').value, 10) || 0,
-    pageDelayMax: parseInt($('#set-pageDelayMax').value, 10) || 0,
     querySuffix: $('#set-querySuffix').value.trim(),
-    maxSerpPages: Math.min(Math.max(parseInt($('#set-maxSerpPages').value, 10) || 10, 1), 20),
   };
 }
 
@@ -420,6 +436,9 @@ function bindUI() {
   $('#saveSettings').addEventListener('click', saveSettings);
   $('#stopBrowserBtn').addEventListener('click', stopBrowser);
   $('#testProxyBtn').addEventListener('click', testProxy);
+  $('#toggleProxyPw').addEventListener('click', togglePasswordReveal);
+  document.querySelectorAll('.settings-tab').forEach((t) =>
+    t.addEventListener('click', () => switchSettingsTab(t.dataset.tab)));
 
   // Logs modal
   $('#closeLogsModal').addEventListener('click', closeLogsModal);

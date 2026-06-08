@@ -123,14 +123,20 @@ async function stop() {
   lastSessionToken = null;
 }
 
+// Probe a proxy by hitting api.ipify.org through it. IMPORTANT: this is fully
+// ISOLATED from the live-run singleton — it points an HttpsProxyAgent straight
+// at the raw upstream URL (creds embedded) and never calls start()/mutates
+// baseUrl/upstreamUrl/session state. So clicking "Test proxy" mid-run can no
+// longer hijack an in-flight job's egress. Falls back to the currently-running
+// chain's upstream only when no explicit url is supplied.
 async function testProxy({ url, timeoutMs = 12000 } = {}) {
-  const target = url ? await start({ url }) : getLocalUrl();
+  const target = url || upstreamUrl;
   if (!target) throw new Error('No proxy URL configured');
   const agent = new HttpsProxyAgent(target);
   const res = await fetch('https://api.ipify.org?format=json', { agent, timeout: timeoutMs });
   if (!res.ok) throw new Error(`ipify HTTP ${res.status}`);
   const json = await res.json();
-  return { ip: json.ip, via: target, upstream: upstreamUrl };
+  return { ip: json.ip, via: target, upstream: target };
 }
 
 process.on('exit',    () => { try { stop(); } catch {} });

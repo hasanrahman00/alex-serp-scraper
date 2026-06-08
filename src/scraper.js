@@ -12,38 +12,57 @@ function isGoogleBlock(page) {
   return /\/sorry\//i.test(page.url());
 }
 
-// Parse the SERP DOM into per-result {title, url, description} objects.
-// We try Google's stable wrapper classes first (.MjjYud / .tF2Cxc / .g),
-// then fall back to a structural heuristic ("div that contains exactly one
-// h3 and one external link"). This is robust against Google's frequent
-// class-name churn.
+// Parse the SERP DOM into per-result objects:
+//   { url, title, description, blockText }
+// A result is structurally an <a> wrapping an <h3> that links to an external
+// page — starting from those is robust to Google's constant class-name churn.
+// We climb to the result container and capture its FULL visible text
+// (blockText), not just the narrow snippet, so every email that lives anywhere
+// inside the result can later be attributed to it (title / url / description).
 async function extractSerpResults(page) {
   return page.evaluate(() => {
     const out = [];
     const seen = new Set();
-    const blocks = new Set();
-    document.querySelectorAll('div.MjjYud, div.tF2Cxc, div.g[data-hveid]').forEach((b) => blocks.add(b));
-    // Heuristic fallback: any div with one h3 + one external anchor.
-    if (blocks.size === 0) {
-      document.querySelectorAll('div').forEach((b) => {
-        if (b.querySelector('h3') && b.querySelector('a[href^="http"]')) blocks.add(b);
-      });
-    }
-    const DESC_SEL = 'div[data-sncf="1"], .VwiC3b, .yXK7lf, .lyLwlc, span.aCOpRe, .lEBKkf';
-    for (const block of blocks) {
-      const a = block.querySelector('a[href^="http"]:not([href*="google."])');
-      const h3 = block.querySelector('h3');
-      if (!a || !h3) continue;
+    const DESC_SEL = 'div[data-sncf="1"], .VwiC3b, .yXK7lf, .lyLwlc, span.aCOpRe, .lEBKkf, .r025kc';
+
+    // Collect the title-link anchor for every h3 on the page.
+    const anchors = new Set();
+    document.querySelectorAll('h3').forEach((h3) => {
+      const a = h3.closest('a[href^="http"]');
+      if (a) anchors.add(a);
+    });
+
+    for (const a of anchors) {
       const url = a.href;
+      if (!url || !/^https?:\/\//.test(url)) continue;
+      if (/\bgoogle\.[a-z.]+\/(search|url|imgres|maps)/i.test(url)) continue;
+      if (url.includes('webcache.googleusercontent')) continue;
       if (seen.has(url)) continue;
-      const title = (h3.textContent || '').trim();
+      const h3 = a.querySelector('h3');
+      const title = h3 ? (h3.textContent || '').trim() : '';
       if (!title) continue;
-      const descEl = block.querySelector(DESC_SEL);
+
+      // Climb to the result container: nearest known wrapper, else a few
+      // levels up — far enough to include the snippet beneath the title link.
+      let container = a.closest('div.MjjYud, div.tF2Cxc, div.g');
+      if (!container) {
+        let node = a;
+        for (let i = 0; i < 4 && node.parentElement; i++) {
+          node = node.parentElement;
+          if (node.querySelector && node.querySelector(DESC_SEL)) { container = node; break; }
+        }
+        container = container || a.parentElement || a;
+      }
+
+      const descEl = container.querySelector(DESC_SEL);
       let description = descEl ? (descEl.textContent || '').trim() : '';
-      // Strip Google's trailing "...Read more" suffix.
       description = description.replace(/\s*…?\s*Read more\s*$/i, '').trim();
+
+      const blockText = (container.innerText || container.textContent || '')
+        .replace(/\s+/g, ' ').trim();
+
       seen.add(url);
-      out.push({ url, title, description });
+      out.push({ url, title, description, blockText: blockText.slice(0, 4000) });
     }
     return out;
   });
@@ -69,48 +88,63 @@ function cleanDescription(desc) {
   return s.trim();
 }
 
-// Given the parsed SERP results + the full page HTML, build a unified list
-// of email records each carrying its source-result context (title / url /
-// description). Descriptions are cleaned (dates + "Read more" stripped).
+// Given the parsed SERP results + the full page HTML, build a unified list of
+// email records, each enriched with the result it belongs to (title / url /
+// description). Strategy: take EVERY email on the page, then attribute each to
+// the result block whose visible text contains it. This fills the metadata for
+// any email living inside a result snippet — even ones the narrow description
+// selector didn't capture (the previous cause of blank title/url/description).
 function buildEmailRecords(serpResults, pageHtml, pageUrl) {
   const out = [];
-  const seenPerPage = new Set();
+  const seen = new Set();
 
-  // Pass 1 — per-result emails (high-confidence, since Google chose to
-  // surface the snippet because it matched the query).
-  for (const r of serpResults) {
-    const cleanedDesc = cleanDescription(r.description);
-    const descEmails = extractFromText(cleanedDesc);
-    const titleEmails = extractFromText(r.title);
-    const all = new Set([...descEmails, ...titleEmails]);
-    for (const email of all) {
-      const inDesc = cleanedDesc && cleanedDesc.toLowerCase().includes(email);
-      out.push({
-        email,
-        title: r.title,
-        url: r.url,
-        description: cleanedDesc,
-        in_text: !!inDesc,
-        context: inDesc ? 'description' : 'title',
-      });
-      seenPerPage.add(email);
-    }
-  }
+  // Build searchable blocks: cleaned description for display + a lowercased
+  // haystack (title + raw snippet + full block text) for attribution.
+  const blocks = serpResults.map((r) => ({
+    title: r.title,
+    url: r.url,
+    description: cleanDescription(r.description),
+    haystack: `${r.title}\n${r.description || ''}\n${r.blockText || ''}`.toLowerCase(),
+  }));
+  const ownerOf = (emailLower) => blocks.find((b) => b.haystack.includes(emailLower));
 
-  // Pass 2 — emails in the rest of the page HTML that didn't already land
-  // in pass 1 (footers, knowledge panels, embedded widgets, etc.).
+  const pushRecord = (email, owner, fallbackCtx) => {
+    out.push({
+      email,
+      title: owner ? owner.title : '',
+      url: owner ? owner.url : '',
+      description: owner ? owner.description : '',
+      in_text: owner ? owner.description.toLowerCase().includes(email.toLowerCase()) : false,
+      context: owner ? 'result' : fallbackCtx,
+    });
+  };
+
+  // 1) Every email found anywhere on the page (rendered body + raw HTML +
+  //    mailto + cloudflare-decoded), attributed to its owning result block.
+  //    An email that can't be tied to any result AND only came from page body
+  //    / raw HTML is SERP noise (tracking, JSON-LD, hidden markup, footer) — we
+  //    drop it so the output isn't padded with blank, source-less junk rows.
+  //    Unattributed mailto / cloudflare emails are kept (structured, high-intent).
+  const KEEP_UNATTRIBUTED = new Set(['mailto', 'cloudflare']);
   const pageEmails = extractFromHtml(pageHtml, pageUrl);
   for (const e of pageEmails) {
-    if (seenPerPage.has(e.email)) continue;
-    out.push({
-      email: e.email,
-      title: '',
-      url: '',
-      description: '',
-      in_text: false,
-      context: `page-${e.context || 'html'}`,
-    });
-    seenPerPage.add(e.email);
+    const key = e.email.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const owner = ownerOf(key);
+    if (!owner && !KEEP_UNATTRIBUTED.has(e.context)) continue;
+    pushRecord(e.email, owner, `page-${e.context || 'html'}`);
+  }
+
+  // 2) Safety net — emails visible inside a result block but missed by the
+  //    page-HTML scan (rare). Attribute them to their block.
+  for (const b of blocks) {
+    for (const email of extractFromText(b.haystack)) {
+      const key = email.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      pushRecord(email, b, 'result');
+    }
   }
   return out;
 }
@@ -158,10 +192,22 @@ async function getBrowser({ cdpEndpoint, headless, slowMo, proxyUrl }) {
   }
 }
 
+// Owning the dialog event prevents Playwright's internal auto-handler from
+// racing with auto-dismissing dialogs (the "No dialog is showing" crash).
+function attachDialogHandler(target) {
+  target.on('dialog', async (dialog) => {
+    try { await dialog.dismiss(); } catch { /* dialog vanished before we got here — fine */ }
+  });
+}
+
 async function newContext(browser, attached, { userAgent }) {
   if (attached) {
     const contexts = browser.contexts();
-    if (contexts.length) return { ctx: contexts[0], owned: false };
+    if (contexts.length) {
+      const ctx = contexts[0];
+      attachDialogHandler(ctx);
+      return { ctx, owned: false };
+    }
   }
   const ctx = await browser.newContext({
     userAgent: userAgent || DEFAULT_UA,
@@ -175,6 +221,7 @@ async function newContext(browser, attached, { userAgent }) {
     Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
     window.chrome = { runtime: {} };
   });
+  attachDialogHandler(ctx);
   return { ctx, owned: true };
 }
 
@@ -247,6 +294,7 @@ async function runJob(jobConfig, { onLog, onProgress, onEmails, isCancelled, isP
   const existingPages = ctx.pages();
   const ownedPage = existingPages.length === 0;
   const page = ownedPage ? await ctx.newPage() : existingPages[0];
+  attachDialogHandler(page);
   try { await page.bringToFront(); } catch {}
   page.setDefaultNavigationTimeout(navTimeoutMs);
 
@@ -284,9 +332,13 @@ async function runJob(jobConfig, { onLog, onProgress, onEmails, isCancelled, isP
       // Queries can be plain strings OR { query, pages } objects (when the
       // uploaded CSV has an optional Pages column).
       const q = typeof rawQ === 'string' ? rawQ : (rawQ && rawQ.query) || '';
+      // Per-row Pages column wins (capped only by the hard ceiling); otherwise
+      // the per-job value, clamped to [1, MAX_SERP_PAGES] so an explicit 0 /
+      // negative / NaN from a direct API caller falls back to a sane depth
+      // rather than silently inflating to a full crawl.
       const queryPagesCap = (rawQ && typeof rawQ.pages === 'number' && rawQ.pages > 0)
         ? Math.min(rawQ.pages, MAX_SERP_PAGES)
-        : Math.min(maxSerpPages || 10, MAX_SERP_PAGES);
+        : Math.min(Math.max(parseInt(maxSerpPages, 10) || 10, 1), MAX_SERP_PAGES);
       if (!q) { log(`[query ${qi + 1}/${queries.length}] empty — skipping`); tick(); continue; }
       if (isCancelled?.()) { log('cancelled'); break; }
       while (isPaused?.()) await sleep(500);
@@ -369,27 +421,11 @@ async function runJob(jobConfig, { onLog, onProgress, onEmails, isCancelled, isP
         const serpResults = await extractSerpResults(page).catch(() => []);
         log(`page ${p}: ${serpResults.length} SERP result block(s) parsed`);
 
-        // Cross-reference: extract emails per result + from page chrome.
+        // Build the enriched, noise-filtered email records for this SERP page.
+        // (No iframe sweep: on a Google SERP the only iframes are Google's own
+        // widgets — e.g. ogs.google.com — which only ever yield blank, junk
+        // rows. We extract straight from the result blocks instead.)
         const records = buildEmailRecords(serpResults, html, pageUrl);
-
-        // Iframe sweep (rare, but cheap — keep it).
-        for (const frame of page.frames()) {
-          if (frame === page.mainFrame()) continue;
-          try {
-            const fHtml = await frame.content();
-            if (!fHtml) continue;
-            const fEmails = extractFromHtml(fHtml, frame.url() || pageUrl);
-            if (fEmails.length) {
-              log(`+${fEmails.length} from iframe ${(frame.url() || '').slice(0, 60)}`);
-              for (const e of fEmails) {
-                records.push({
-                  email: e.email, title: '', url: '', description: '',
-                  in_text: false, context: `iframe-${e.context || 'html'}`,
-                });
-              }
-            }
-          } catch {}
-        }
 
         if (records.length) {
           log(`page ${p}: ${records.length} email candidate(s) (${records.filter((r) => r.in_text).length} in-text)`);

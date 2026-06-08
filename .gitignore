@@ -1,7 +1,11 @@
 node_modules/
+.env
+.env.*
+!.env.example
 data/chrome-profile/
 data/jobs/*.json
 data/results/*
 data/uploads/*
+data/settings.json
 *.log
 .DS_Store

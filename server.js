@@ -16,6 +16,19 @@ const settings = require('./src/settings');
 const browser = require('./src/browser');
 const proxy = require('./src/proxy');
 
+// Playwright + CDP occasionally throws "No dialog is showing" when a JS
+// dialog auto-dismisses before its internal handler runs. We register our
+// own dialog handler in scraper.js to pre-empt this, but the global net is
+// here so a stray race never takes the whole server down.
+process.on('unhandledRejection', (err) => {
+  const msg = (err && err.message) || String(err);
+  if (/No dialog is showing|Target closed|Browser has been closed/i.test(msg)) {
+    console.warn('[suppressed]', msg);
+    return;
+  }
+  console.error('[unhandledRejection]', err);
+});
+
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const UPLOADS_DIR = path.join(__dirname, 'data', 'uploads');
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -239,20 +252,42 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
           queries = buildQueries(data, columnUsed, pagesColumnUsed);
         }
       } else if (Array.isArray(data.queries)) {
-        queries = data.queries;
+        // Normalize the {queries:[...]} shape the same as every other path:
+        // accept bare strings or {query, pages} objects, dedupe, and
+        // parseInt-coerce pages — so a JSON Pages value behaves like the CSV one.
+        const rows = data.queries.map((x) => (typeof x === 'string' ? { query: x } : (x || {})));
+        queries = buildQueries(rows, 'query', 'pages');
       }
     } else {
       const buf = fs.readFileSync(req.file.path, 'utf8');
       const records = parseCsv(buf, { columns: true, skip_empty_lines: true, trim: true });
+      let hasRealHeader = false;
       if (records.length) {
         const keys = Object.keys(records[0]);
-        columnUsed = pickQueryColumn(keys);
+        const queryCol = pickColumn(keys, 'query');
         pagesColumnUsed = pickPagesColumn(keys);
-        queries = buildQueries(records, columnUsed, pagesColumnUsed);
+        // A "real" header means the file genuinely has a Query/Pages column.
+        hasRealHeader = !!(queryCol || pagesColumnUsed);
+        if (hasRealHeader) {
+          columnUsed = queryCol || keys[0];
+          queries = buildQueries(records, columnUsed, pagesColumnUsed);
+        }
       }
-      if (queries.length === 0) {
+      // No recognizable Query/Pages header → treat the file as a bare list.
+      // Gated on !hasRealHeader so a Query/Pages file with an all-empty Query
+      // column returns [] (→ "No queries found") instead of scraping the header
+      // names + page numbers. A single-column list takes every cell (preserving
+      // the first line, which `columns:true` would eat as a header); a
+      // multi-column file with no header takes the first column as best effort.
+      if (!hasRealHeader) {
         const flat = parseCsv(buf, { skip_empty_lines: true, trim: true });
-        queries = [...new Set(flat.flat().map((s) => String(s).trim()).filter(Boolean))];
+        const maxCols = flat.reduce((m, row) => Math.max(m, row.length), 0);
+        const cells = maxCols <= 1
+          ? flat.flat()
+          : flat.map((row) => row[0]);
+        queries = [...new Set(cells.map((s) => String(s ?? '').trim()).filter(Boolean))];
+        columnUsed = null;
+        pagesColumnUsed = null;
       }
     }
   } catch (err) {

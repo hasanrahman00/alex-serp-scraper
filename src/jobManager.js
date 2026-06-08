@@ -173,12 +173,13 @@ class JobManager extends EventEmitter {
         // Merge live settings + auto-resolved CDP endpoint into job config.
         const s = settings.load();
         const runConfig = {
-          pageDelayMin: s.pageDelayMin,
-          pageDelayMax: s.pageDelayMax,
           querySuffix: s.querySuffix || '',
           proxyUrl: s.proxyUrl || '',
           proxyStickySession: !!s.proxyStickySession,
-          maxSerpPages: parseInt(s.maxSerpPages, 10) || 10,
+          // SERP page depth is a per-JOB setting now (chosen at upload), carried
+          // on job.config; fall back to 10 for jobs created without one. The
+          // inter-page delay uses the scraper's built-in human-like default.
+          maxSerpPages: 10,
           ...job.config,
         };
 
