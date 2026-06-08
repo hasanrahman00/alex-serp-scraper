@@ -1,7 +1,4 @@
 node_modules/
-.env
-.env.*
-!.env.example
 data/chrome-profile/
 data/jobs/*.json
 data/results/*
