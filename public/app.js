@@ -44,14 +44,16 @@ function setDot(parentSel, on) {
 }
 
 /* -------- per-job derived stats --------
-   green  = live unique emails extracted
-   orange = failed queries (nav errors, /sorry/ blocks, no results)
+   blue   = unique result links scraped
+   green  = unique emails extracted
+   orange = failed queries (no results — nav errors / /sorry/ blocks)
 */
 function computeStats(j) {
   const totalQueries = (j.config?.queries || []).length;
+  const liveLinks = j.liveLinkCount || 0;
   const liveUnique = j.liveEmailCount || 0;
-  const failed = (j.results || []).filter((r) => r.error || (Array.isArray(r.emails) && r.emails.length === 0)).length;
-  return { totalQueries, liveUnique, failed };
+  const failed = (j.results || []).filter((r) => r.error || r.links === 0).length;
+  return { totalQueries, liveLinks, liveUnique, failed };
 }
 
 /* -------- job row rendering -------- */
@@ -83,8 +85,9 @@ function renderJobRow(j) {
     </div>
 
     <div class="stats">
-      <span class="${cls(stats.liveUnique, 'green')}" title="Unique emails extracted (live)">${stats.liveUnique.toLocaleString()}</span>
-      <span class="${cls(stats.failed, 'orange')}" title="Failed queries (nav errors / /sorry/ blocks / no results)">${stats.failed.toLocaleString()}</span>
+      <span class="${cls(stats.liveLinks, 'info')}" title="Unique result links scraped (all SERP links)">${stats.liveLinks.toLocaleString()}</span>
+      <span class="${cls(stats.liveUnique, 'green')}" title="Unique emails extracted">${stats.liveUnique.toLocaleString()}</span>
+      <span class="${cls(stats.failed, 'orange')}" title="Failed queries (no results — nav errors / /sorry/ blocks)">${stats.failed.toLocaleString()}</span>
     </div>
 
     <div class="row-actions" data-id="${j.id}"></div>
@@ -406,7 +409,7 @@ function connectWs() {
       }
     } else if (m.type === 'liveEmails') {
       const j = state.jobs.get(m.jobId);
-      if (j) { j.liveEmailCount = m.total; rerenderRow(m.jobId); }
+      if (j) { j.liveEmailCount = m.total; if (m.totalLinks != null) j.liveLinkCount = m.totalLinks; rerenderRow(m.jobId); }
     } else if (m.type === 'removed') {
       state.jobs.delete(m.jobId);
       renderJobsList();

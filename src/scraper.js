@@ -1,7 +1,7 @@
 'use strict';
 
 const { chromium } = require('playwright');
-const { extractFromHtml, extractFromText, dedupeAndScore } = require('./emailExtractor');
+const { extractFromHtml, extractFromText } = require('./emailExtractor');
 const { scrollToPagination, clickNextPage, getNextPageUrl } = require('./serpPaginator');
 const proxyMod = require('./proxy');
 
@@ -88,15 +88,19 @@ function cleanDescription(desc) {
   return s.trim();
 }
 
-// Given the parsed SERP results + the full page HTML, build a unified list of
-// email records, each enriched with the result it belongs to (title / url /
-// description). Strategy: take EVERY email on the page, then attribute each to
-// the result block whose visible text contains it. This fills the metadata for
-// any email living inside a result snippet — even ones the narrow description
-// selector didn't capture (the previous cause of blank title/url/description).
+// Given the parsed SERP results + the full page HTML, build the row set for the
+// page. We output ONE ROW PER RESULT LINK (title / url / description) regardless
+// of whether it has an email — so the CSV captures every link Google returned
+// (~10 per page). Emails are attributed to the result block whose text contains
+// them; a link with no email still gets a row (blank email). Unattributable
+// page-noise emails are dropped; structured mailto/cloudflare emails not tied to
+// a result are kept as their own rows.
+//
+// Each row: { email, title, url, description, in_text, isLink }
+//   isLink=true  → the row represents a SERP result link (email may be '')
+//   isLink=false → a structured orphan email with no result link
 function buildEmailRecords(serpResults, pageHtml, pageUrl) {
   const out = [];
-  const seen = new Set();
 
   // Build searchable blocks: cleaned description for display + a lowercased
   // haystack (title + raw snippet + full block text) for attribution.
@@ -105,46 +109,56 @@ function buildEmailRecords(serpResults, pageHtml, pageUrl) {
     url: r.url,
     description: cleanDescription(r.description),
     haystack: `${r.title}\n${r.description || ''}\n${r.blockText || ''}`.toLowerCase(),
+    emails: [],
   }));
   const ownerOf = (emailLower) => blocks.find((b) => b.haystack.includes(emailLower));
 
-  const pushRecord = (email, owner, fallbackCtx) => {
-    out.push({
-      email,
-      title: owner ? owner.title : '',
-      url: owner ? owner.url : '',
-      description: owner ? owner.description : '',
-      in_text: owner ? owner.description.toLowerCase().includes(email.toLowerCase()) : false,
-      context: owner ? 'result' : fallbackCtx,
-    });
-  };
-
-  // 1) Every email found anywhere on the page (rendered body + raw HTML +
-  //    mailto + cloudflare-decoded), attributed to its owning result block.
-  //    An email that can't be tied to any result AND only came from page body
-  //    / raw HTML is SERP noise (tracking, JSON-LD, hidden markup, footer) — we
-  //    drop it so the output isn't padded with blank, source-less junk rows.
-  //    Unattributed mailto / cloudflare emails are kept (structured, high-intent).
-  const KEEP_UNATTRIBUTED = new Set(['mailto', 'cloudflare']);
-  const pageEmails = extractFromHtml(pageHtml, pageUrl);
-  for (const e of pageEmails) {
+  // Collect every unique email on the page (rendered body + raw HTML + mailto +
+  // cloudflare), plus any visible inside a block but missed by the page scan.
+  const seenEmail = new Set();
+  const allEmails = [];
+  for (const e of extractFromHtml(pageHtml, pageUrl)) {
     const key = e.email.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const owner = ownerOf(key);
-    if (!owner && !KEEP_UNATTRIBUTED.has(e.context)) continue;
-    pushRecord(e.email, owner, `page-${e.context || 'html'}`);
+    if (seenEmail.has(key)) continue;
+    seenEmail.add(key);
+    allEmails.push({ email: e.email, context: e.context || 'html' });
   }
-
-  // 2) Safety net — emails visible inside a result block but missed by the
-  //    page-HTML scan (rare). Attribute them to their block.
   for (const b of blocks) {
     for (const email of extractFromText(b.haystack)) {
       const key = email.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      pushRecord(email, b, 'result');
+      if (seenEmail.has(key)) continue;
+      seenEmail.add(key);
+      allEmails.push({ email, context: 'result' });
     }
+  }
+
+  // Attribute emails to their owning result; keep structured orphans; drop noise.
+  const KEEP_UNATTRIBUTED = new Set(['mailto', 'cloudflare', 'result']);
+  const orphanEmails = [];
+  for (const e of allEmails) {
+    const owner = ownerOf(e.email.toLowerCase());
+    if (owner) owner.emails.push(e.email);
+    else if (KEEP_UNATTRIBUTED.has(e.context)) orphanEmails.push(e.email);
+    // else: unattributed page noise (tracking / JSON-LD / hidden markup) — drop
+  }
+
+  // One row per result link — with its email(s), or a single blank-email row.
+  for (const b of blocks) {
+    if (b.emails.length) {
+      for (const email of b.emails) {
+        out.push({
+          email, title: b.title, url: b.url, description: b.description,
+          in_text: b.description.toLowerCase().includes(email.toLowerCase()),
+          isLink: true,
+        });
+      }
+    } else {
+      out.push({ email: '', title: b.title, url: b.url, description: b.description, in_text: false, isLink: true });
+    }
+  }
+  // Structured emails with no associated result link (rare).
+  for (const email of orphanEmails) {
+    out.push({ email, title: '', url: '', description: '', in_text: false, isLink: false });
   }
   return out;
 }
@@ -387,7 +401,7 @@ async function runJob(jobConfig, { onLog, onProgress, onEmails, isCancelled, isP
           log('[proxy] sticky session rejected by upstream — disabling rotation for the rest of this run (likely a free-tier Webshare account; sticky requires a paid plan)');
         }
         tick();
-        allResults.push({ query: q, emails: [] });
+        allResults.push({ query: q, links: 0, emails: 0 }); // nav failed → no results
         continue; // move on to the next query — never abort the whole run
       }
 
@@ -421,14 +435,15 @@ async function runJob(jobConfig, { onLog, onProgress, onEmails, isCancelled, isP
         const serpResults = await extractSerpResults(page).catch(() => []);
         log(`page ${p}: ${serpResults.length} SERP result block(s) parsed`);
 
-        // Build the enriched, noise-filtered email records for this SERP page.
-        // (No iframe sweep: on a Google SERP the only iframes are Google's own
-        // widgets — e.g. ogs.google.com — which only ever yield blank, junk
-        // rows. We extract straight from the result blocks instead.)
+        // Build the page's rows: one per result LINK (with email or blank) +
+        // any structured orphan emails. We capture every link Google returned,
+        // not just the ones that happen to have an email.
         const records = buildEmailRecords(serpResults, html, pageUrl);
 
         if (records.length) {
-          log(`page ${p}: ${records.length} email candidate(s) (${records.filter((r) => r.in_text).length} in-text)`);
+          const linkRows = records.filter((r) => r.isLink).length;
+          const emailRows = records.filter((r) => r.email).length;
+          log(`page ${p}: ${linkRows} link(s), ${emailRows} with email`);
           queryEmails.push(...records.map((e) => ({ ...e, query: q })));
           if (onEmails) {
             try {
@@ -442,7 +457,7 @@ async function runJob(jobConfig, { onLog, onProgress, onEmails, isCancelled, isP
             } catch (cbErr) { log(`onEmails callback error: ${cbErr.message}`); }
           }
         } else {
-          log(`page ${p}: no emails on this page`);
+          log(`page ${p}: no results on this page`);
         }
 
         // Move to the next page if there is one.
@@ -468,9 +483,10 @@ async function runJob(jobConfig, { onLog, onProgress, onEmails, isCancelled, isP
 
       }
 
-      const scored = dedupeAndScore(queryEmails);
-      allResults.push({ query: q, emails: scored });
-      log(`[query ${qi + 1}/${queries.length}] complete: ${scored.length} unique email candidate(s)`);
+      const links = new Set(queryEmails.filter((r) => r.url).map((r) => r.url.toLowerCase())).size;
+      const emails = new Set(queryEmails.filter((r) => r.email).map((r) => r.email.toLowerCase())).size;
+      allResults.push({ query: q, links, emails });
+      log(`[query ${qi + 1}/${queries.length}] complete: ${links} link(s), ${emails} email(s)`);
       tick();
     }
   } finally {

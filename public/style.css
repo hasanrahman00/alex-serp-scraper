@@ -185,6 +185,7 @@ code { font: 12.5px ui-monospace, SF Mono, Menlo, Consolas, monospace; backgroun
   cursor: help; min-width: 24px; text-align: center;
 }
 .stat.green { color: var(--good); }
+.stat.info { color: var(--info); }
 .stat.yellow { color: var(--warn); }
 .stat.red { color: var(--bad); }
 .stat.purple { color: var(--purple); border-bottom: 1.5px dotted var(--purple); padding-bottom: 1px; }

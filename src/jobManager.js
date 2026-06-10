@@ -6,7 +6,6 @@ const { v4: uuid } = require('uuid');
 const { EventEmitter } = require('events');
 const { parse: parseCsv } = require('csv-parse/sync');
 const { runJob } = require('./scraper');
-const { dedupeAndScore } = require('./emailExtractor');
 const settings = require('./settings');
 const browser = require('./browser');
 const proxy = require('./proxy');
@@ -116,9 +115,11 @@ class JobManager extends EventEmitter {
     job.liveCsvPath = liveCsv.path;
     onLog(`[live-csv] streaming results to ${liveCsv.path}`);
 
-    // Job-wide dedupe set. Pre-load any addresses already on disk from a
-    // previous run so re-runs append ONLY new emails — never duplicates.
+    // Job-wide dedupe sets. We dedupe email rows by email and link rows
+    // (results with no email) by URL — so re-runs append ONLY new rows.
+    // Pre-load both from any CSV already on disk.
     const seenEmails = new Set();
+    const seenLinks = new Set();
     try {
       if (fs.existsSync(liveCsv.path) && fs.statSync(liveCsv.path).size > 0) {
         const records = parseCsv(fs.readFileSync(liveCsv.path, 'utf8'), {
@@ -129,40 +130,60 @@ class JobManager extends EventEmitter {
         });
         for (const r of records) {
           const e = String(r.email || '').toLowerCase().trim();
+          const u = String(r.url || '').toLowerCase().trim();
           if (e && e.includes('@')) seenEmails.add(e);
+          if (u) seenLinks.add(u);
         }
-        if (seenEmails.size) onLog(`[live-csv] loaded ${seenEmails.size} known address(es) from previous run — duplicates will be skipped`);
+        if (seenEmails.size || seenLinks.size) {
+          onLog(`[live-csv] loaded ${seenLinks.size} link(s) + ${seenEmails.size} email(s) from previous run — duplicates will be skipped`);
+        }
       }
     } catch (err) {
       onLog(`[live-csv] couldn't preload dedupe set: ${err.message}`);
     }
     job.liveEmailCount = seenEmails.size;
+    job.liveLinkCount = seenLinks.size;
 
     const onEmails = ({ query, sourceUrl, sourceTitle, serpPage, emails }) => {
       let added = 0;
       const justAdded = [];
-      for (const e of emails) {
-        const key = String(e.email || '').toLowerCase().trim();
-        if (!key || !key.includes('@')) continue;
-        if (seenEmails.has(key)) continue;
-        seenEmails.add(key);
+      const writeRow = (e) => {
         liveCsv.append({
           query,
-          email: e.email,
+          email: e.email || '',
           title: e.title || '',
           url: e.url || '',
           description: (e.description || '').slice(0, 500), // truncate long snippets
           serp_page: serpPage != null ? `page ${serpPage}` : (sourceTitle || ''),
         });
         added++;
-        if (justAdded.length < 10) justAdded.push(e.email);
+      };
+      for (const e of emails) {
+        const email = String(e.email || '').toLowerCase().trim();
+        const url = String(e.url || '').toLowerCase().trim();
+        if (email && email.includes('@')) {
+          // Email row — dedup by email; remember the link too so we don't
+          // later emit a duplicate blank-email row for the same URL.
+          if (seenEmails.has(email)) continue;
+          seenEmails.add(email);
+          if (url) seenLinks.add(url);
+          writeRow(e);
+          if (justAdded.length < 10) justAdded.push(e.email);
+        } else if (url) {
+          // Result link with no email — dedup by URL.
+          if (seenLinks.has(url)) continue;
+          seenLinks.add(url);
+          writeRow(e);
+        }
       }
       if (added > 0) {
         job.liveEmailCount = seenEmails.size;
+        job.liveLinkCount = seenLinks.size;
         this.emit('liveEmails', {
           jobId: job.id,
           added,
           total: job.liveEmailCount,
+          totalLinks: job.liveLinkCount,
           sample: justAdded,
         });
       }
@@ -240,16 +261,13 @@ class JobManager extends EventEmitter {
         }
 
         const scraped = await runJob(runConfig, { onLog, onProgress, onEmails, isCancelled, isPaused });
-        job.results = scraped;
+        job.results = scraped; // [{ query, links, emails }]
 
-        const allCandidates = [];
-        for (const q of scraped) for (const e of q.emails) allCandidates.push({ ...e, query: q.query });
-        const dedupedEmails = dedupeAndScore(allCandidates);
-        onLog(`merged into ${dedupedEmails.length} unique email candidates across all queries`);
+        const totalLinks = scraped.reduce((n, q) => n + (q.links || 0), 0);
+        const totalEmails = scraped.reduce((n, q) => n + (q.emails || 0), 0);
+        onLog(`scrape complete: ${seenLinks.size} unique link(s), ${seenEmails.size} unique email(s) across ${scraped.length} queries (raw per-query: ${totalLinks} links / ${totalEmails} emails)`);
 
-        // No DeepSeek validation — relying on the proxy + regex filters only.
-        // Keep job.validated as an empty array for backward UI compatibility.
-        job.validated = [];
+        job.validated = []; // (no DeepSeek validation step)
 
         job.status = job._control.cancelled ? 'cancelled' : 'completed';
         job.finishedAt = Date.now();
