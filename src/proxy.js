@@ -21,6 +21,11 @@ const ProxyChain = require('proxy-chain');
 const fetch = require('node-fetch');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
+// Stable local port for the chain. A CDP/headful Chrome launched with
+// --proxy-server=127.0.0.1:<port> keeps routing correctly across dev (nodemon)
+// restarts instead of being stranded on a dead random port. Override via env.
+const LOCAL_CHAIN_PORT = parseInt(process.env.PROXY_CHAIN_PORT || '24000', 10);
+
 let server = null;
 let serverPort = null;
 let baseUrl = null;       // configured URL from settings (with -rotate or whatever)
@@ -80,13 +85,20 @@ async function start({ url } = {}) {
     return getLocalUrl();
   }
 
-  server = new ProxyChain.Server({
-    port: 0, // random free port
-    prepareRequestFunction: () => ({
-      upstreamProxyUrl: upstreamUrl,
-    }),
+  const mkServer = (port) => new ProxyChain.Server({
+    port,
+    prepareRequestFunction: () => ({ upstreamProxyUrl: upstreamUrl }),
   });
-  await server.listen();
+  // Prefer the stable port so Chrome's --proxy-server stays valid across
+  // restarts; fall back to an OS-assigned port if it's already taken.
+  try {
+    server = mkServer(LOCAL_CHAIN_PORT);
+    await server.listen();
+  } catch {
+    try { if (server) await server.close(true); } catch {}
+    server = mkServer(0);
+    await server.listen();
+  }
   serverPort = server.port;
   return getLocalUrl();
 }

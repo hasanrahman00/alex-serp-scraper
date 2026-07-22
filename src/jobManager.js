@@ -215,6 +215,12 @@ class JobManager extends EventEmitter {
           try {
             const probe = await proxy.testProxy({ url: runConfig.proxyUrl, timeoutMs: 5000 });
             onLog(`[proxy] preflight OK · egress IP ${probe.ip}`);
+            // Bring the local rotating-proxy chain up NOW (idempotent). This sets
+            // the chain's baseUrl so the scraper's per-query session rotation
+            // (setSessionToken) actually rewrites the upstream — otherwise it
+            // silently no-ops when we reuse an already-running Chrome.
+            try { await proxy.start({ url: runConfig.proxyUrl }); }
+            catch (e) { onLog(`[proxy] chain start warning: ${e.message}`); }
           } catch (err) {
             onLog(`[proxy] preflight FAILED: ${err.message}`);
             onLog(`[proxy] falling back to LOCAL NETWORK connection (no proxy) for this run`);
@@ -225,38 +231,70 @@ class JobManager extends EventEmitter {
           onLog('[proxy] not configured — using LOCAL NETWORK connection');
         }
 
-        // Auto-attach: reuse cached endpoint, otherwise probe the port; if Chrome
-        // isn't there, launch it from the configured chromePath / userDataDir.
+        // ─── Browser attach / launch ─────────────────────────────────────
         if (!runConfig.cdpEndpoint && s.debugPort) {
-          let endpoint = browser.getCachedEndpoint();
-          if (!endpoint) {
-            try {
-              const conn = await browser.connect({ debugPort: s.debugPort });
-              endpoint = conn.endpoint;
-              onLog(`[browser] reusing existing Chrome on port ${s.debugPort}`);
-            } catch {
-              if (!s.chromePath) {
-                onLog('[browser] Chrome not running and no executable path configured — falling back to bundled Chromium');
-              } else {
-                const effectiveProxy = runConfig.proxyUrl || '';
-                onLog(`[browser] no Chrome on port ${s.debugPort} — launching ${s.chromePath}${effectiveProxy ? ' (with proxy)' : ' (direct connection)'}`);
-                try {
-                  const launched = await browser.launch({
-                    chromePath: s.chromePath,
-                    userDataDir: s.userDataDir,
-                    debugPort: s.debugPort,
-                    proxyUrl: effectiveProxy,
-                  });
-                  endpoint = launched.endpoint;
-                  onLog(`[browser] launched · pid=${launched.pid || 'n/a'} · ${endpoint}${launched.proxy ? ` · proxy ${launched.proxy}` : ' · direct'}`);
-                } catch (err) {
-                  onLog(`[browser] launch failed: ${err.message} — falling back to bundled Chromium`);
-                }
+          let endpoint = null;
+
+          if (runConfig.proxyUrl) {
+            // PROXY RUN: Chrome must be routed through the local chain via
+            // --proxy-server, which can ONLY be set at launch — you cannot inject
+            // a browser-level proxy into an already-attached Chrome over CDP. So
+            // never just attach here: always resolve through launch(), which
+            // reuses the Chrome we already launched with this proxy (same
+            // process) or (re)launches one with --proxy-server pointing at the
+            // chain, killing+respawning a mismatched Chrome on the debug port
+            // (same user-data-dir, so the Google session survives). This is the
+            // fix for the proxy + per-query rotation silently not applying in
+            // CDP/headful mode (run went out on the direct IP).
+            if (!s.chromePath) {
+              onLog('[browser] proxy configured but no Chrome path set — falling back to bundled Chromium (native proxy)');
+            } else {
+              onLog(`[browser] proxy run — launching/reusing ${s.chromePath} through the rotating chain`);
+              try {
+                const launched = await browser.launch({
+                  chromePath: s.chromePath,
+                  userDataDir: s.userDataDir,
+                  debugPort: s.debugPort,
+                  proxyUrl: runConfig.proxyUrl,
+                });
+                endpoint = launched.endpoint;
+                onLog(`[browser] ${launched.alreadyRunning ? 'reusing' : 'launched'} Chrome · pid=${launched.pid || 'n/a'} · ${endpoint}${launched.proxy ? ` · via ${launched.proxy}` : ''}`);
+              } catch (err) {
+                onLog(`[browser] proxied launch failed: ${err.message} — falling back to bundled Chromium`);
               }
             }
           } else {
-            onLog(`[browser] reusing cached CDP endpoint`);
+            // DIRECT RUN (no proxy): cheapest path — reuse a cached endpoint,
+            // else attach to an existing Chrome, else launch a direct one.
+            endpoint = browser.getCachedEndpoint();
+            if (!endpoint) {
+              try {
+                const conn = await browser.connect({ debugPort: s.debugPort });
+                endpoint = conn.endpoint;
+                onLog(`[browser] reusing existing Chrome on port ${s.debugPort}`);
+              } catch {
+                if (!s.chromePath) {
+                  onLog('[browser] Chrome not running and no executable path configured — falling back to bundled Chromium');
+                } else {
+                  onLog(`[browser] no Chrome on port ${s.debugPort} — launching ${s.chromePath} (direct connection)`);
+                  try {
+                    const launched = await browser.launch({
+                      chromePath: s.chromePath,
+                      userDataDir: s.userDataDir,
+                      debugPort: s.debugPort,
+                    });
+                    endpoint = launched.endpoint;
+                    onLog(`[browser] launched · pid=${launched.pid || 'n/a'} · ${endpoint} · direct`);
+                  } catch (err) {
+                    onLog(`[browser] launch failed: ${err.message} — falling back to bundled Chromium`);
+                  }
+                }
+              }
+            } else {
+              onLog('[browser] reusing cached CDP endpoint');
+            }
           }
+
           if (endpoint) runConfig.cdpEndpoint = endpoint;
         }
 

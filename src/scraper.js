@@ -322,7 +322,13 @@ async function runJob(jobConfig, { onLog, onProgress, onEmails, isCancelled, isP
     const ip = await page.evaluate(() => {
       try { return JSON.parse(document.body.innerText).ip; } catch { return document.body.innerText.trim(); }
     });
-    if (proxyUrl) log(`[browser] egress IP through proxy: ${ip}`);
+    // Label the egress by ACTUAL routing, not just config. The local chain
+    // being up (getLocalUrl) is the real signal that Chrome's --proxy-server
+    // has somewhere to route; if a proxy was configured but the chain is not
+    // active, this run is leaking the direct IP — say so loudly.
+    const chainActive = !!proxyMod.getLocalUrl();
+    if (proxyUrl && chainActive) log(`[browser] egress IP through proxy chain: ${ip}`);
+    else if (proxyUrl && !chainActive) log(`[browser] ⚠ proxy configured but local chain is NOT active — egress is DIRECT (${ip}); per-query rotation will not work`);
     else log(`[browser] egress IP (direct, no proxy): ${ip}`);
   } catch (err) {
     log(`[browser] egress IP check failed: ${err.message}`);
